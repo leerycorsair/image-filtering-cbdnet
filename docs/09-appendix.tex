@@ -1,0 +1,326 @@
+\begin{appendices}
+
+\chapter{Модель нейронной сети}
+
+Далее в листингах А.1--А.3 приведена модель нейронной сети.
+
+\begin{lstlisting}[caption={Модель нейронной сети (часть 1)}]
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class single_conv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super(single_conv, self).__init__()
+        self.conv = nn.Sequential(nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.ReLU(inplace=True))
+
+    def forward(self, x):
+        return self.conv(x)
+
+class up(nn.Module):
+    def __init__(self, in_ch):
+        super(up, self).__init__()
+        self.up = nn.ConvTranspose2d(in_ch, in_ch // 2, 2, stride=2)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = F.pad(x1, (diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2))
+        x = x2 + x1
+        return x
+
+class outconv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super(outconv, self).__init__()
+        self.flatten = nn.Flatten()
+        self.fc1 = nn.Linear(32 * 32 * in_ch, 32 * 32 * out_ch)
+        self.fc2 = nn.Linear(32 * 32 * out_ch, 32 * 32 * out_ch)
+        self.fc3 = nn.Linear(32 * 32 * out_ch, 32 * 32 * out_ch)
+
+    def forward(self, x):
+        x = self.flatten(x)
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x.view(-1, 3, 32, 32)
+\end{lstlisting}
+
+\clearpage
+
+\begin{lstlisting}[caption={Модель нейронной сети (часть 2)}]
+class FCN(nn.Module):
+    def __init__(self):
+        super(FCN, self).__init__()
+        self.fcn = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 3, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.fcn(x)
+
+class UNet(nn.Module):
+    def __init__(self):
+        super(UNet, self).__init__()
+
+        self.inc = nn.Sequential(single_conv(6, 64), single_conv(64, 64))
+
+        self.down1 = nn.AvgPool2d(2)
+        self.conv1 = nn.Sequential(
+            single_conv(64, 128), single_conv(128, 128), single_conv(128, 128)
+        )
+
+        self.down2 = nn.AvgPool2d(2)
+        self.conv2 = nn.Sequential(
+            single_conv(128, 256),
+            single_conv(256, 256),
+            single_conv(256, 256),
+            single_conv(256, 256),
+            single_conv(256, 256),
+            single_conv(256, 256),
+        )
+
+        self.up1 = up(256)
+        self.conv3 = nn.Sequential(
+            single_conv(128, 128), single_conv(128, 128), single_conv(128, 128)
+        )
+\end{lstlisting}
+
+\clearpage
+
+\begin{lstlisting}[caption={Модель нейронной сети (часть 3)}]
+        self.up2 = up(128)
+        self.conv4 = nn.Sequential(single_conv(64, 64), single_conv(64, 3))
+
+        self.outc = outconv(3, 3)
+
+    def forward(self, x):
+        inx = self.inc(x)
+        down1 = self.down1(inx)
+        conv1 = self.conv1(down1)
+        down2 = self.down2(conv1)
+        conv2 = self.conv2(down2)
+        up1 = self.up1(conv2, conv1)
+        conv3 = self.conv3(up1)
+        up2 = self.up2(conv3, inx)
+        conv4 = self.conv4(up2)
+        out = self.outc(conv4)
+        return out
+
+class MyCNNModel(nn.Module):
+    def __init__(self):
+        super(MyCNNModel, self).__init__()
+        self.fcn = FCN()
+        self.unet = UNet()
+
+    def forward(self, x):
+        noise_level = self.fcn(x)
+        concat_img = torch.cat([x, noise_level], dim=1)
+        out = self.unet(concat_img) + x
+        return out
+
+class fixed_loss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, out_image, gt_image):
+        return F.mse_loss(out_image, gt_image)
+\end{lstlisting}
+
+\clearpage
+
+\chapter{Модуль обучения нейронной сети}
+
+Далее в листингах Б.1--Б.3 приведен модуль обучения нейронной сети.
+
+\begin{lstlisting}[caption={Модуль обучения нейронной сети (часть 1)}]
+import os
+import argparse
+import torch
+import torch.nn as nn
+
+from dataset.loader import Real
+from methods.models.my_cnn_model import MyCNNModel, fixed_loss
+from consts import PATHS, NAMES
+
+
+def train(train_loader, model, criterion, optimizer, scheduler):
+    model.train()
+    for noise_img, clean_img in train_loader:
+        input_var = noise_img.cuda()
+        target_var = clean_img.cuda()
+        noise_level_est, output = model(input_var)
+        loss = criterion(output, target_var, noise_level_est)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    scheduler.step()
+
+
+def main(batch_size: int, epochs: int, lr: float) -> None:
+    save_path = PATHS["my_cnn"]
+    train_path = PATHS["train_dataset"]
+    model_name = NAMES["my_cnn"]
+    model = MyCNNModel()
+    model.cuda()
+    model = nn.DataParallel(model)
+    if os.path.exists(os.path.join(save_path, model_name)):
+        model_info = torch.load(
+            os.path.join(save_path, model_name), map_location=torch.device("cuda")
+        )
+    print("==> loading existing model:", os.path.join(save_path, model_name))
+    model.load_state_dict(model_info["state_dict"])
+    optimizer = torch.optim.Adam(model.parameters())
+    optimizer.load_state_dict(model_info["optimizer"])
+
+\end{lstlisting}
+\clearpage
+
+\begin{lstlisting}[caption={Модуль обучения нейронной сети (часть 2)}]
+	scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    scheduler.load_state_dict(model_info["scheduler"])
+    cur_epoch = model_info["epoch"]
+        else:
+        if not os.path.isdir(save_path):
+            os.makedirs(save_path)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        cur_epoch = 0
+
+    criterion = fixed_loss()
+    criterion.cuda()
+
+    train_dataset = Real(train_path, 5)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    for epoch in range(cur_epoch, cur_epoch + epochs + 1):
+        train(train_loader, model, criterion, optimizer, scheduler)
+
+        torch.save(
+            {
+                "epoch": epoch + 1,
+                "state_dict": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+            },
+            os.path.join(save_path, model_name),
+        )
+
+        print(
+            "Epochs [{0}/{1}]\t"
+            "lr: {lr:.10f}".format(epoch, cur_epoch + epochs, lr=optimizer.param_groups[-1]["lr"])
+        )
+\end{lstlisting}
+\clearpage
+
+\begin{lstlisting}[caption={Модуль обучения нейронной сети (часть 3)}]
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bs", default=32, type=int, help="batch size (default 32)")
+    parser.add_argument("--epochs", default=50, type=int, help="epochs (default 50)")
+    parser.add_argument(
+        "--lr", default=2e-4, type=float, help="learningrate (default 0.00002)"
+    )
+    args = parser.parse_args()
+
+    main(args.bs, args.epochs, args.lr)
+\end{lstlisting}
+\clearpage
+
+\chapter{Модуль со вспомогательными утилитами}
+
+Далее в листингах В.1--В.2 приведен модуль со вспомогательными утилитами. 
+
+\begin{lstlisting}[caption={Модуль со вспомогательными утилитами (часть 1)}]
+import numpy as np
+import cv2
+from skimage import color
+from skimage.metrics import structural_similarity
+
+def read_img(filename: str) -> np.ndarray:
+    img = cv2.imread(filename)
+    return img
+
+def write_img(img: np.ndarray, filename: str, path: str):
+    cv2.imwrite(path + filename, img)
+
+def hwc_to_chw(img: np.ndarray) -> np.ndarray:
+    return np.transpose(img, axes=[2, 0, 1]).astype("float32")
+
+def chw_to_hwc(img: np.ndarray) -> np.ndarray:
+    return np.transpose(img, axes=[1, 2, 0]).astype("float32")
+
+def psnr(img1: np.ndarray, img2: np.ndarray) -> float:
+    mse = np.mean((img1 - img2) ** 2)
+    if mse == 0:
+        return float("inf")
+    max_pixel = 255.0
+    psnr = 20 * np.log10(max_pixel / np.sqrt(mse))
+    return psnr
+
+def ssim(img1: np.ndarray, img2: np.ndarray) -> float:
+    img1_gray = color.rgb2gray(img1)
+    img2_gray = color.rgb2gray(img2)
+    ssim_score = structural_similarity(
+        img1_gray, img2_gray, data_range=img1_gray.max() - img1_gray.min())
+    return ssim_score
+\end{lstlisting}
+\clearpage
+
+\begin{lstlisting}[caption={Модуль со вспомогательными утилитами (часть 2)}]
+def split_image(image, patch_size=32):
+    height, width = image.shape[:2]
+    num_patches_x = (width + patch_size - 1) // patch_size
+    num_patches_y = (height + patch_size - 1) // patch_size
+    new_width = num_patches_x * patch_size
+    new_height = num_patches_y * patch_size
+    new_image = np.zeros((new_height, new_width, 3), dtype=np.uint8)
+    new_image[:height, :width, :] = image
+    patches = np.array(
+        [
+            new_image[
+                j * patch_size : j * patch_size + patch_size,
+                i * patch_size : i * patch_size + patch_size,
+            ]
+            for j in range(num_patches_y)
+            for i in range(num_patches_x)
+        ]
+    )
+    return patches
+
+
+def restore_image(patches, width, height, patch_size=32):
+    num_patches_x = (width + patch_size - 1) // patch_size
+    num_patches_y = (height + patch_size - 1) // patch_size
+    restored_width = num_patches_x * patch_size
+    restored_height = num_patches_y * patch_size
+    restored_image = np.zeros((restored_height, restored_width, 3), dtype=np.uint8)
+    for i, patch in enumerate(patches):
+        row = i // num_patches_x
+        col = i % num_patches_x
+        left = col * patch_size
+        upper = row * patch_size
+        restored_image[upper : upper + patch_size, left : left + patch_size] = patch
+    restored_image = restored_image[:height, :width]
+    return restored_image
+\end{lstlisting}
+
+\chapter{Презентация}
+
+\end{appendices}
